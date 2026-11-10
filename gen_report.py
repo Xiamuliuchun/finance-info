@@ -18,10 +18,12 @@ GitHub Actions 运行:
 
 约定:
     1. Token 只从环境变量 TUSHARE_TOKEN 读取，不硬编码、不写进报告。
-    2. 目标交易日动态解析为「北京时间今天及之前的最近一个交易日」：
-       优先用 Tushare 交易日历 trade_cal，失败则降级用上证指数日线回溯。
+    2. 目标交易日动态解析为「最近一个已收盘交易日」，默认排除北京时间今天
+       （当天尚未收盘、Tushare 约 19:00 才更新当日数据）：优先用 Tushare 交易日历
+       trade_cal，失败则降级用上证指数日线回溯，再失败回退为北京时间昨天。
        输出为当前目录下的 market-review-<YYYYMMDD>.html（文件名随交易日变化），
-       同名覆盖。可用环境变量 TRADE_DATE=YYYYMMDD 手动指定以补跑历史报告。
+       同名覆盖。用环境变量 TRADE_DATE=YYYYMMDD 可手动指定，
+       既用于补跑历史，也可在收盘后强制生成当天报告。
     3. 每个数据源独立异常捕获；失败打印 [ERROR] 并在报告里标注缺失，
        绝不编造数字。核心行情全部失败时以非零状态退出。
     4. 输出为纯 HTML + 内联 CSS，无 JS / 无 CDN / 无外部字体，可离线打开。
@@ -135,7 +137,12 @@ def beijing_now():
 
 
 def resolve_trade_date(pro):
-    """解析最近交易日：手动指定 > 交易日历 > 指数日线回溯 > 北京时间今天。"""
+    """解析「最近一个已收盘交易日」：手动指定 > 交易日历 > 指数日线回溯 > 北京时间昨天。
+
+    默认刻意排除北京时间今天：A 股当日尚未收盘、Tushare 约 19:00 才更新当日数据，
+    早上跑任务时取今天会拿到空数据或残缺数据。若确实要跑当天（例如收盘后手动触发），
+    用 TRADE_DATE=YYYYMMDD 显式指定即可。
+    """
     override = os.environ.get("TRADE_DATE", "").strip()
     if override:
         if len(override) == 8 and override.isdigit():
@@ -148,16 +155,21 @@ def resolve_trade_date(pro):
     today = now.strftime("%Y%m%d")
     start = (now - timedelta(days=20)).strftime("%Y%m%d")
 
+    def closed_only(values):
+        """只保留严格早于今天的日期（YYYYMMDD 字典序即时间序）。"""
+        return sorted({str(v) for v in values if str(v) < today})
+
     try:
         cal = pro.trade_cal(exchange="SSE", start_date=start, end_date=today,
                             is_open="1", fields="cal_date")
         if cal is not None and not cal.empty and "cal_date" in cal.columns:
-            dates = sorted(str(d) for d in cal["cal_date"].dropna().tolist())
+            dates = closed_only(cal["cal_date"].dropna().tolist())
             if dates:
-                print("[INFO] 交易日历解析最近交易日 %s（北京时间今天 %s）"
+                print("[INFO] 最近已收盘交易日 %s（北京时间今天 %s，已排除今天）"
                       % (dates[-1], today))
                 return dates[-1]
-        print("[WARN] 交易日历返回为空，尝试指数日线回溯。", file=sys.stderr)
+        print("[WARN] 交易日历没有早于今天的开市日，尝试指数日线回溯。",
+              file=sys.stderr)
     except Exception as exc:
         print("[WARN] 交易日历 trade_cal 不可用（%s: %s），尝试指数日线回溯。"
               % (type(exc).__name__, exc), file=sys.stderr)
@@ -166,17 +178,18 @@ def resolve_trade_date(pro):
         hist = pro.index_daily(ts_code="000001.SH", start_date=start,
                                end_date=today, fields="trade_date,close")
         if hist is not None and not hist.empty and "trade_date" in hist.columns:
-            dates = sorted(str(d) for d in hist["trade_date"].dropna().tolist())
+            dates = closed_only(hist["trade_date"].dropna().tolist())
             if dates:
-                print("[INFO] 降级回溯得到最近交易日 %s" % dates[-1])
+                print("[INFO] 降级回溯得到最近已收盘交易日 %s" % dates[-1])
                 return dates[-1]
     except Exception as exc:
         print("[WARN] 指数日线回溯也失败（%s: %s）。"
               % (type(exc).__name__, exc), file=sys.stderr)
 
-    print("[WARN] 交易日自动解析失败，回退为北京时间今天 %s（若休市将无数据）。"
-          % today, file=sys.stderr)
-    return today
+    yesterday = (now - timedelta(days=1)).strftime("%Y%m%d")
+    print("[WARN] 交易日自动解析失败，回退为北京时间昨天 %s（若休市将无数据）。"
+          % yesterday, file=sys.stderr)
+    return yesterday
 
 
 def date_span():
