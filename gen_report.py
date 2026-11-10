@@ -18,11 +18,14 @@ GitHub Actions 运行:
 
 约定:
     1. Token 只从环境变量 TUSHARE_TOKEN 读取，不硬编码、不写进报告。
-    2. 运行后直接在「当前工作目录」覆盖生成 market-review-20261109.html。
+    2. 目标交易日动态解析为「北京时间今天及之前的最近一个交易日」：
+       优先用 Tushare 交易日历 trade_cal，失败则降级用上证指数日线回溯。
+       输出为当前目录下的 market-review-<YYYYMMDD>.html（文件名随交易日变化），
+       同名覆盖。可用环境变量 TRADE_DATE=YYYYMMDD 手动指定以补跑历史报告。
     3. 每个数据源独立异常捕获；失败打印 [ERROR] 并在报告里标注缺失，
        绝不编造数字。核心行情全部失败时以非零状态退出。
     4. 输出为纯 HTML + 内联 CSS，无 JS / 无 CDN / 无外部字体，可离线打开。
-    5. 只依赖 tushare 与 pandas（其余均为 Python 标准库）。
+    5. 运行依赖见 requirements.txt（tushare / pandas / six），其余为标准库。
 """
 
 import html as html_lib
@@ -35,8 +38,11 @@ import pandas as pd
 import tushare as ts
 
 # ---------------------------------------------------------------- 配置
-TRADE_DATE = "20261109"                       # YYYYMMDD，目标交易日
-OUTPUT_FILE = "market-review-20261109.html"   # 当前目录，同名覆盖
+# 目标交易日与输出文件名在 main() 中动态解析后写入下面两个全局变量。
+# 需要补跑某一天时，可用环境变量 TRADE_DATE=YYYYMMDD 手动指定。
+TRADE_DATE = None
+OUTPUT_FILE = None
+OUTPUT_PATTERN = "market-review-{date}.html"  # 当前目录，同名覆盖
 NEWS_LIMIT = 10                               # 报告展示的快讯条数
 
 A_INDEXES = [
@@ -121,6 +127,56 @@ def safe_call(label, func):
     except Exception as exc:
         record_error(label, exc)
         return None
+
+
+def beijing_now():
+    """GitHub Actions runner 走 UTC；中国无夏令时，固定 +8 小时即北京时间。"""
+    return datetime.utcnow() + timedelta(hours=8)
+
+
+def resolve_trade_date(pro):
+    """解析最近交易日：手动指定 > 交易日历 > 指数日线回溯 > 北京时间今天。"""
+    override = os.environ.get("TRADE_DATE", "").strip()
+    if override:
+        if len(override) == 8 and override.isdigit():
+            print("[INFO] 使用环境变量指定的交易日 %s" % override)
+            return override
+        print("[WARN] TRADE_DATE=%r 格式无效（应为 YYYYMMDD），改用自动解析。"
+              % override, file=sys.stderr)
+
+    now = beijing_now()
+    today = now.strftime("%Y%m%d")
+    start = (now - timedelta(days=20)).strftime("%Y%m%d")
+
+    try:
+        cal = pro.trade_cal(exchange="SSE", start_date=start, end_date=today,
+                            is_open="1", fields="cal_date")
+        if cal is not None and not cal.empty and "cal_date" in cal.columns:
+            dates = sorted(str(d) for d in cal["cal_date"].dropna().tolist())
+            if dates:
+                print("[INFO] 交易日历解析最近交易日 %s（北京时间今天 %s）"
+                      % (dates[-1], today))
+                return dates[-1]
+        print("[WARN] 交易日历返回为空，尝试指数日线回溯。", file=sys.stderr)
+    except Exception as exc:
+        print("[WARN] 交易日历 trade_cal 不可用（%s: %s），尝试指数日线回溯。"
+              % (type(exc).__name__, exc), file=sys.stderr)
+
+    try:
+        hist = pro.index_daily(ts_code="000001.SH", start_date=start,
+                               end_date=today, fields="trade_date,close")
+        if hist is not None and not hist.empty and "trade_date" in hist.columns:
+            dates = sorted(str(d) for d in hist["trade_date"].dropna().tolist())
+            if dates:
+                print("[INFO] 降级回溯得到最近交易日 %s" % dates[-1])
+                return dates[-1]
+    except Exception as exc:
+        print("[WARN] 指数日线回溯也失败（%s: %s）。"
+              % (type(exc).__name__, exc), file=sys.stderr)
+
+    print("[WARN] 交易日自动解析失败，回退为北京时间今天 %s（若休市将无数据）。"
+          % today, file=sys.stderr)
+    return today
 
 
 def date_span():
@@ -536,7 +592,8 @@ def render(ctx):
     parts.append('<h1>市场复盘 · %s</h1>' % esc(TRADE_DATE))
     parts.append('<div class="meta">数据源：Tushare Pro 接口 ｜ 交易日 %s ｜ '
                  '生成时间 %s ｜ 纯 HTML 输出，无外部依赖</div></div>'
-                 % (esc(TRADE_DATE), esc(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))))
+                 % (esc(TRADE_DATE),
+                    esc(beijing_now().strftime("%Y-%m-%d %H:%M:%S") + " 北京时间")))
 
     parts.append('<div class="card tldr"><div class="lead">%s</div>' % esc(headline))
     parts.append('<div class="kpis">')
@@ -615,6 +672,7 @@ def render(ctx):
 
 # ---------------------------------------------------------------- 主流程
 def main():
+    global TRADE_DATE, OUTPUT_FILE
     token = os.environ.get("TUSHARE_TOKEN", "").strip()
     if not token:
         print("[FATAL] 环境变量 TUSHARE_TOKEN 未设置。"
@@ -629,7 +687,10 @@ def main():
               file=sys.stderr)
         return 1
 
-    print("[INFO] 目标交易日 %s，开始拉取数据..." % TRADE_DATE)
+    TRADE_DATE = resolve_trade_date(pro)
+    OUTPUT_FILE = OUTPUT_PATTERN.format(date=TRADE_DATE)
+    print("[INFO] 目标交易日 %s，输出文件 %s，开始拉取数据..."
+          % (TRADE_DATE, OUTPUT_FILE))
     ctx = fetch_all(pro)
 
     if not ctx.get("a_indexes"):
