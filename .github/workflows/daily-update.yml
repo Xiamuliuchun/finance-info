@@ -1,1 +1,36 @@
+name: Daily Market Report Update
+on:
+  schedule:
+    - cron: "0 17 * * 1-5"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Generate html report
+        env:
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+        run: python gen_report.py
+      
+      - name: Commit & push updated html
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: "market_trend-20261109.html"
+          message: "auto update market report from tushare"
+          default_author: github_actions
 
