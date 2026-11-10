@@ -3,12 +3,15 @@ name: Daily Market Report Update
 on:
   schedule:
     # GitHub Actions 的 cron 一律按 UTC 解析，on.schedule 不支持 timezone 字段。
-    # UTC 12:00 = 北京时间 20:00，晚于 Tushare 行情接口约 19:00 的更新时点。
-    - cron: "0 12 * * 1-5"
+    # UTC 00:30 = 北京时间 08:30，一早运行，报告内容为「最近一个已收盘交易日」。
+    # 周二~周六早分别对应生成周一~周五的报告，正好覆盖每个交易日且不重不漏；
+    # 前一交易日数据在前一晚 19:00 后已由 Tushare 更新完毕。
+    # 避开整点可减少 GitHub 定时任务的排队延迟。
+    - cron: "30 0 * * 2-6"
   workflow_dispatch:
     inputs:
       trade_date:
-        description: "手动指定交易日 YYYYMMDD（留空则自动解析最近交易日）"
+        description: "手动指定交易日 YYYYMMDD（留空则取最近一个已收盘交易日）"
         required: false
         type: string
 
@@ -40,6 +43,14 @@ jobs:
           # 手动触发时可在输入框填 YYYYMMDD 补跑历史报告。
           TRADE_DATE: ${{ github.event.inputs.trade_date }}
         run: python gen_report.py
+
+      - name: Upload html report
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-review-${{ github.run_number }}
+          path: market-review-*.html
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Commit & push updated html
         uses: EndBug/add-and-commit@v9
